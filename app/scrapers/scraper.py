@@ -1,16 +1,23 @@
 import asyncio
-import os
+import json
 import time
+import sys
+import re  # Novo import para extrair o tempo do erro por Regex
+from pathlib import Path
 from playwright.async_api import async_playwright
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from google import genai
 from google.genai import types
 
-GEMINI_API_KEY = "AQ.Ab8RN6K-c9d4pJgpvoibLtt2Hbroa21ev-mb_HFv26BLyg8RfQ"
-client = genai.Client(api_key=GEMINI_API_KEY)
+# --- HACK DE PATH DINÂMICO ---
+raiz_projeto = str(Path(__file__).resolve().parent.parent.parent)
+if raiz_projeto not in sys.path:
+    sys.path.insert(0, raiz_projeto)
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+from app.config import settings
+
+client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
 class Plano(BaseModel):
     plano: str = Field(description="Nome do plano. Ex: Padrão com Anúncios, Premium, Mega Fan, Familiar")
@@ -24,12 +31,12 @@ class ListaPlanos(BaseModel):
 
 def processar_texto_com_ia(nome_streaming, texto_bruto):
     tentativas_maximas = 3
-    delay = 2  # Segundos iniciais de espera
+    delay = 2
 
     prompt = f"""
     Você é um extrator de dados especialista em assinaturas de streaming.
     Analise o texto bruto extraído do site do {nome_streaming} e descubra todos os planos disponíveis, seus respectivos preços e condições de faturamento.
-    ignore propagandas ou textos que não sejam relacionados a valores de planos atuais praticados no Brasil.
+    ignore propagandas ou textos que não sejam relacionados a valores de planos antigos ou atuais praticados no Brasil.
     
     Texto bruto do site:
     \"\"\"{texto_bruto}\"\"\"
@@ -49,15 +56,12 @@ def processar_texto_com_ia(nome_streaming, texto_bruto):
             return response.text
         except Exception as e:
             erro_str = str(e)
-            # Verifica se é um erro temporário do servidor (503 ou sobrecarga)
             if "503" in erro_str or "UNAVAILABLE" in erro_str or "high demand" in erro_str:
                 if tentativa < tentativas_maximas:
                     print(f"⚠️ [GEMINI AI] Servidor instável (503). Tentativa {tentativa}/{tentativas_maximas} falhou. Aguardando {delay}s antes de reprocessar...")
                     time.sleep(delay)
-                    delay *= 2  # Dobra o tempo de espera para a próxima tentativa (Backoff Exponencial)
+                    delay *= 2
                     continue
-            
-            # Se for outro tipo de erro ou se esgotarem as tentativas, retorna a falha estruturada
             return f'{{"streaming": "{nome_streaming}", "planos": [], "error": "{erro_str}"}}'
 
 async def tratar_interacoes_especificas(page, nome_streaming):
@@ -76,8 +80,8 @@ async def tratar_interacoes_especificas(page, nome_streaming):
         pass
 
 async def tentar_acessar_pagina(browser, url, nome_streaming):
-    print(f"🌐 [PLAYWRIGHT] Raspando texto bruto do {nome_streaming}...")
-    context = await browser.new_context(user_agent=USER_AGENT)
+    print(f"\n🌐 [PLAYWRIGHT] Raspando texto bruto do {nome_streaming}...")
+    context = await browser.new_context(user_agent=settings.USER_AGENT)
     page = await context.new_page()
     texto_acumulado = ""
     
@@ -100,17 +104,7 @@ async def tentar_acessar_pagina(browser, url, nome_streaming):
         return f'{{"streaming": "{nome_streaming}", "planos": [], "error": "{str(e)}"}}'
 
 async def rodar_scrapers():
-    print("🚀 Inicializando motor híbrido (Playwright + Gemini API com Auto-Retry)...")
-    streamings = [
-        {"nome": "Netflix", "url": "https://help.netflix.com/pt/node/24926"},
-        {"nome": "Spotify", "url": "https://www.spotify.com/br-pt/premium/#plans"},
-        {"nome": "Crunchyroll", "url": "https://www.crunchyroll.com/pt-br/welcome"},
-        {"nome": "Prime Video", "url": "https://www.primevideo.com/signup/ref=atv_nb_join_prime"},
-        {"nome": "HBO Max", "url": "https://www.hbomax.com/br/pt"},
-        {"nome": "Disney+", "url": "https://www.disneyplus.com/pt-br"},
-        {"nome": "Apple TV", "url": "https://tv.apple.com/br"},
-        {"nome": "YouTube Premium", "url": "https://www.youtube.com/premium?ybp=Sg0IBhIJdW5saW1pdGVk4AEB"}
-    ]
+    print("🚀 Inicializando motor híbrido (Playwright + Gemini API)...")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -118,14 +112,33 @@ async def rodar_scrapers():
             args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
         )
         
-        for stream in streamings:
+        for stream in settings.STREAMINGS:
             json_resultado = await tentar_acessar_pagina(browser, stream["url"], stream["nome"])
+            
+            # --- CONDICIONAL DE BLOQUEIO POR ESTOURO DE COTA (429) ---
+            if "RESOURCE_EXHAUSTED" in json_resultado or "429" in json_resultado:
+                await browser.close()
+                print(f"\n🛑 [CRÍTICO] Cota estourada no {stream['nome']}. Interrompendo a execução geral!")
+                
+                # Procura o tempo sugerido no erro (ex: "Please retry in 21.775904231s." ou "retryDelay: '21s'")
+                tempo_espera = "alguns minutos (verifique o painel do Google Cloud)"
+                match = re.search(r"Please retry in ([^']+?s)\.", json_resultado)
+                if match:
+                    tempo_espera = match.group(1)
+                else:
+                    match_alt = re.search(r"retryDelay': '(\d+s)'", json_resultado)
+                    if match_alt:
+                        tempo_espera = match_alt.group(1)
+                
+                print(f"⏳ Tempo estimado para poder rodar de novo: {tempo_espera}\n")
+                sys.exit(1) # Finaliza o script imediatamente com código de erro
+            
             print(f"\n--- 📊 {stream['nome'].upper()} JSON FINAL ---")
             print(json_resultado)
             print("-" * 60 + "\n")
             
         await browser.close()
-        print("🔒 Processo finalizado.")
+        print("🔒 Processo finalizado com sucesso.")
 
 if __name__ == "__main__":
     asyncio.run(rodar_scrapers())
