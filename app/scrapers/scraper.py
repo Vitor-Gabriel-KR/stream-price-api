@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from playwright.async_api import async_playwright
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -22,28 +23,42 @@ class ListaPlanos(BaseModel):
     planos: List[Plano]
 
 def processar_texto_com_ia(nome_streaming, texto_bruto):
-    try:
-        prompt = f"""
-        Você é um extrator de dados especialista em assinaturas de streaming.
-        Analise o texto bruto extraído do site do {nome_streaming} e descubra todos os planos disponíveis, seus respectivos preços e condições de faturamento.
-        ignore propagandas ou textos que não sejam relacionados a valores de planos atuais praticados no Brasil.
-        
-        Texto bruto do site:
-        \"\"\"{texto_bruto}\"\"\"
-        """
-        
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=ListaPlanos,
-                temperature=0.1
-            ),
-        )
-        return response.text
-    except Exception as e:
-        return f'{{"streaming": "{nome_streaming}", "planos": [], "error": "{str(e)}"}}'
+    tentativas_maximas = 3
+    delay = 2  # Segundos iniciais de espera
+
+    prompt = f"""
+    Você é um extrator de dados especialista em assinaturas de streaming.
+    Analise o texto bruto extraído do site do {nome_streaming} e descubra todos os planos disponíveis, seus respectivos preços e condições de faturamento.
+    ignore propagandas ou textos que não sejam relacionados a valores de planos atuais praticados no Brasil.
+    
+    Texto bruto do site:
+    \"\"\"{texto_bruto}\"\"\"
+    """
+
+    for tentativa in range(1, tentativas_maximas + 1):
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=ListaPlanos,
+                    temperature=0.1
+                ),
+            )
+            return response.text
+        except Exception as e:
+            erro_str = str(e)
+            # Verifica se é um erro temporário do servidor (503 ou sobrecarga)
+            if "503" in erro_str or "UNAVAILABLE" in erro_str or "high demand" in erro_str:
+                if tentativa < tentativas_maximas:
+                    print(f"⚠️ [GEMINI AI] Servidor instável (503). Tentativa {tentativa}/{tentativas_maximas} falhou. Aguardando {delay}s antes de reprocessar...")
+                    time.sleep(delay)
+                    delay *= 2  # Dobra o tempo de espera para a próxima tentativa (Backoff Exponencial)
+                    continue
+            
+            # Se for outro tipo de erro ou se esgotarem as tentativas, retorna a falha estruturada
+            return f'{{"streaming": "{nome_streaming}", "planos": [], "error": "{erro_str}"}}'
 
 async def tratar_interacoes_especificas(page, nome_streaming):
     try:
@@ -85,7 +100,7 @@ async def tentar_acessar_pagina(browser, url, nome_streaming):
         return f'{{"streaming": "{nome_streaming}", "planos": [], "error": "{str(e)}"}}'
 
 async def rodar_scrapers():
-    print("🚀 Inicializando motor híbrido (Playwright + Gemini API)...")
+    print("🚀 Inicializando motor híbrido (Playwright + Gemini API com Auto-Retry)...")
     streamings = [
         {"nome": "Netflix", "url": "https://help.netflix.com/pt/node/24926"},
         {"nome": "Spotify", "url": "https://www.spotify.com/br-pt/premium/#plans"},
